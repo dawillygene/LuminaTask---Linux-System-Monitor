@@ -1,4 +1,5 @@
 # Build directories
+.github/
 build/
 cmake-build-*/
 CMakeFiles/
