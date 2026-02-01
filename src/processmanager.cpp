@@ -17,6 +17,7 @@
 #include <grp.h>
 #include <cstring>
 #include <cerrno>
+#include <cstdlib>
 
 /**
  * @brief Constructor for ProcessManager
@@ -230,15 +231,78 @@ double ProcessManager::readProcessMemory_(int pid) const {
 }
 
 /**
- * @brief Read process CPU usage (placeholder for future implementation)
+ * @brief Read process CPU usage from /proc/[PID]/stat
  * @param pid Process ID
- * @return CPU percentage (currently returns 0.0)
+ * @return CPU usage percentage (0.0-100.0)
  */
 double ProcessManager::readProcessCpu_(int pid) const {
-    // TODO: Implement CPU usage calculation using /proc/[PID]/stat
-    // This requires tracking time deltas between measurements
-    Q_UNUSED(pid)
-    return 0.0;
+    const QString statPath = QString("/proc/%1/stat").arg(pid);
+    QFile statFile(statPath);
+
+    if (!statFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return 0.0;
+    }
+
+    QTextStream stream(&statFile);
+    const QString line = stream.readLine();
+
+    if (line.isEmpty()) {
+        return 0.0;
+    }
+
+    // Parse the stat line - CPU times are fields 14 (utime) and 15 (stime)
+    // Format: pid (comm) state ppid ... utime stime ...
+    const QStringList parts = line.split(' ', Qt::SkipEmptyParts);
+
+    if (parts.size() < 16) {
+        return 0.0;
+    }
+
+    bool ok1, ok2;
+    const unsigned long utime = parts[13].toULong(&ok1);  // User time
+    const unsigned long stime = parts[14].toULong(&ok2);  // System time
+
+    if (!ok1 || !ok2) {
+        return 0.0;
+    }
+
+    // Calculate total CPU time in clock ticks
+    const unsigned long totalTime = utime + stime;
+
+    // Get system uptime for percentage calculation
+    QFile uptimeFile("/proc/uptime");
+    if (!uptimeFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return 0.0;
+    }
+
+    QTextStream uptimeStream(&uptimeFile);
+    const QString uptimeLine = uptimeStream.readLine();
+    const QStringList uptimeParts = uptimeLine.split(' ', Qt::SkipEmptyParts);
+
+    if (uptimeParts.isEmpty()) {
+        return 0.0;
+    }
+
+    bool uptimeOk;
+    const double uptime = uptimeParts[0].toDouble(&uptimeOk);
+
+    if (!uptimeOk || uptime <= 0) {
+        return 0.0;
+    }
+
+    // Get number of clock ticks per second
+    const long ticksPerSecond = sysconf(_SC_CLK_TCK);
+    if (ticksPerSecond <= 0) {
+        return 0.0;
+    }
+
+    // Calculate CPU usage percentage
+    // CPU% = (total_time / ticks_per_second) / uptime * 100
+    const double cpuSeconds = static_cast<double>(totalTime) / ticksPerSecond;
+    const double cpuPercent = (cpuSeconds / uptime) * 100.0;
+
+    // Clamp to reasonable range (0-100%)
+    return qBound(0.0, cpuPercent, 100.0);
 }
 
 /**
