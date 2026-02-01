@@ -20,6 +20,7 @@
 #include <QTimer>
 #include <QDebug>
 #include <QIcon>
+#include <QMap>
 #include <algorithm>
 
 /**
@@ -29,7 +30,7 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
     , m_mainLayout(std::make_unique<QVBoxLayout>())
     , m_toolbarLayout(std::make_unique<QHBoxLayout>())
-    , m_processTableView(std::make_unique<QTableView>(this))
+    , m_processTreeView(std::make_unique<QTreeView>(this))
     , m_processModel(std::make_unique<QStandardItemModel>(this))
     , m_refreshButton(std::make_unique<QPushButton>("Refresh", this))
     , m_autoRefreshButton(std::make_unique<QPushButton>("Auto Refresh", this))
@@ -47,7 +48,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     // Setup UI components
     setupUI_();
-    setupTableView_();
+    setupTreeView_();
     setupToolbar_();
     setupStatusBar_();
     setupContextMenu_();
@@ -79,9 +80,9 @@ MainWindow::~MainWindow() = default;
  * @brief Handle context menu events
  */
 void MainWindow::contextMenuEvent(QContextMenuEvent* event) {
-    const QModelIndex index = m_processTableView->indexAt(event->pos());
+    const QModelIndex index = m_processTreeView->indexAt(event->pos());
     if (index.isValid()) {
-        m_processTableView->selectionModel()->setCurrentIndex(
+        m_processTreeView->selectionModel()->setCurrentIndex(
             index, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
         m_contextMenu->exec(event->globalPos());
     }
@@ -99,39 +100,41 @@ void MainWindow::setupUI_() {
     // Add toolbar layout to main layout
     m_mainLayout->addLayout(m_toolbarLayout.get());
 
-    // Add table view to main layout
-    m_mainLayout->addWidget(m_processTableView.get());
+    // Add tree view to main layout
+    m_mainLayout->addWidget(m_processTreeView.get());
 }
 
 /**
- * @brief Setup the process table view
+ * @brief Setup the process tree view
  */
-void MainWindow::setupTableView_() {
-    // Set table model
+void MainWindow::setupTreeView_() {
+    // Set tree model
     m_processModel->setHorizontalHeaderLabels(
-        {"PID", "Process Name", "Memory (MB)", "CPU %", "Actions"});
-    m_processTableView->setModel(m_processModel.get());
+        {"Process Name", "Memory (MB)", "CPU %", "PID", "Count"});
+    m_processTreeView->setModel(m_processModel.get());
 
-    // Configure table appearance
-    m_processTableView->setAlternatingRowColors(true);
-    m_processTableView->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_processTableView->setSortingEnabled(true);
-    m_processTableView->setContextMenuPolicy(Qt::CustomContextMenu);
+    // Configure tree appearance
+    m_processTreeView->setAlternatingRowColors(true);
+    m_processTreeView->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_processTreeView->setSortingEnabled(true);
+    m_processTreeView->setContextMenuPolicy(Qt::CustomContextMenu);
+    m_processTreeView->setRootIsDecorated(true);
+    m_processTreeView->setItemsExpandable(true);
 
     // Configure column properties
-    QHeaderView* header = m_processTableView->horizontalHeader();
+    QHeaderView* header = m_processTreeView->header();
     header->setStretchLastSection(true);
-    header->setSectionResizeMode(TABLE_COLUMN_PID, QHeaderView::ResizeToContents);
-    header->setSectionResizeMode(TABLE_COLUMN_NAME, QHeaderView::Stretch);
-    header->setSectionResizeMode(TABLE_COLUMN_MEMORY, QHeaderView::ResizeToContents);
-    header->setSectionResizeMode(TABLE_COLUMN_CPU, QHeaderView::ResizeToContents);
-    header->setSectionResizeMode(TABLE_COLUMN_ACTIONS, QHeaderView::ResizeToContents);
+    header->setSectionResizeMode(TREE_COLUMN_NAME, QHeaderView::Stretch);
+    header->setSectionResizeMode(TREE_COLUMN_MEMORY, QHeaderView::ResizeToContents);
+    header->setSectionResizeMode(TREE_COLUMN_CPU, QHeaderView::ResizeToContents);
+    header->setSectionResizeMode(TREE_COLUMN_PID, QHeaderView::ResizeToContents);
+    header->setSectionResizeMode(TREE_COLUMN_COUNT, QHeaderView::ResizeToContents);
 
     // Connect context menu signal
-    connect(m_processTableView.get(), &QTableView::customContextMenuRequested,
+    connect(m_processTreeView.get(), &QTreeView::customContextMenuRequested,
             [this](const QPoint& pos) {
                 QContextMenuEvent event(QContextMenuEvent::Mouse, pos,
-                                      m_processTableView->mapToGlobal(pos));
+                                      m_processTreeView->mapToGlobal(pos));
                 contextMenuEvent(&event);
             });
 }
@@ -182,7 +185,7 @@ void MainWindow::setupContextMenu_() {
  * @brief Handle processes updated signal
  */
 void MainWindow::onProcessesUpdated_(const QVector<ProcessInfo>& processes) {
-    updateProcessTable_(processes);
+    updateProcessTree_(processes);
     m_statusLabel->setText("Processes updated");
 }
 
@@ -206,7 +209,7 @@ void MainWindow::onProcessTerminated_(int pid, bool success) {
 void MainWindow::onRefreshButtonClicked_() {
     m_statusLabel->setText("Refreshing process list...");
     const QVector<ProcessInfo> processes = m_processManager->getAllProcesses();
-    updateProcessTable_(processes);
+    updateProcessTree_(processes);
     m_statusLabel->setText("Process list refreshed");
 }
 
@@ -258,66 +261,118 @@ void MainWindow::onKillGracefullyAction_() {
 }
 
 /**
- * @brief Update the process table with new data
+ * @brief Update the process tree with new data
  */
-void MainWindow::updateProcessTable_(const QVector<ProcessInfo>& processes) {
+void MainWindow::updateProcessTree_(const QVector<ProcessInfo>& processes) {
     // Clear existing data
-    clearProcessTable_();
+    clearProcessTree_();
 
-    // Reserve space for efficiency
-    m_processModel->setRowCount(processes.size());
+    // Group processes by name
+    QMap<QString, QVector<ProcessInfo>> processGroups;
+    for (const auto& process : processes) {
+        processGroups[process.name].append(process);
+    }
 
-    // Add process data
-    for (int row = 0; row < processes.size(); ++row) {
-        const ProcessInfo& process = processes[row];
+    // Sort groups by total memory usage (descending)
+    QVector<QPair<QString, QVector<ProcessInfo>>> sortedGroups;
+    for (auto it = processGroups.begin(); it != processGroups.end(); ++it) {
+        sortedGroups.append(qMakePair(it.key(), it.value()));
+    }
+    std::sort(sortedGroups.begin(), sortedGroups.end(),
+              [](const QPair<QString, QVector<ProcessInfo>>& a,
+                 const QPair<QString, QVector<ProcessInfo>>& b) {
+                  double totalMemoryA = 0.0;
+                  for (const auto& proc : a.second) totalMemoryA += proc.memoryMB;
+                  double totalMemoryB = 0.0;
+                  for (const auto& proc : b.second) totalMemoryB += proc.memoryMB;
+                  return totalMemoryA > totalMemoryB;
+              });
 
-        // PID
-        QStandardItem* pidItem = new QStandardItem(QString::number(process.pid));
-        pidItem->setData(process.pid, Qt::UserRole);  // Store PID for context menu
-        m_processModel->setItem(row, TABLE_COLUMN_PID, pidItem);
+    // Add grouped process data
+    for (const auto& group : sortedGroups) {
+        const QString& processName = group.first;
+        const QVector<ProcessInfo>& groupProcesses = group.second;
 
-        // Process Name
-        QStandardItem* nameItem = new QStandardItem(process.name);
-        m_processModel->setItem(row, TABLE_COLUMN_NAME, nameItem);
+        // Calculate group totals
+        double totalMemory = 0.0;
+        double avgCpu = 0.0;
+        for (const auto& proc : groupProcesses) {
+            totalMemory += proc.memoryMB;
+            avgCpu += proc.cpuPercent;
+        }
+        avgCpu /= groupProcesses.size();
 
-        // Memory
-        QStandardItem* memoryItem = new QStandardItem(QString::number(process.memoryMB, 'f', 2));
-        memoryItem->setData(process.memoryMB, Qt::UserRole);
-        m_processModel->setItem(row, TABLE_COLUMN_MEMORY, memoryItem);
+        // Create parent item (group)
+        QList<QStandardItem*> groupRow;
+        QStandardItem* nameItem = new QStandardItem(processName);
+        nameItem->setData("group", Qt::UserRole);  // Mark as group item
+        groupRow << nameItem;
 
-        // CPU (placeholder)
-        QStandardItem* cpuItem = new QStandardItem(QString::number(process.cpuPercent, 'f', 1));
-        cpuItem->setData(process.cpuPercent, Qt::UserRole);
-        m_processModel->setItem(row, TABLE_COLUMN_CPU, cpuItem);
+        QStandardItem* memoryItem = new QStandardItem(QString::number(totalMemory, 'f', 2));
+        memoryItem->setData(totalMemory, Qt::UserRole);
+        groupRow << memoryItem;
 
-        // Actions (placeholder for future buttons)
-        QStandardItem* actionsItem = new QStandardItem("Right-click for options");
-        actionsItem->setEditable(false);
-        m_processModel->setItem(row, TABLE_COLUMN_ACTIONS, actionsItem);
+        QStandardItem* cpuItem = new QStandardItem(QString::number(avgCpu, 'f', 1));
+        cpuItem->setData(avgCpu, Qt::UserRole);
+        groupRow << cpuItem;
+
+        QStandardItem* pidItem = new QStandardItem("");  // Empty for groups
+        groupRow << pidItem;
+
+        QStandardItem* countItem = new QStandardItem(QString::number(groupProcesses.size()));
+        countItem->setData(groupProcesses.size(), Qt::UserRole);
+        groupRow << countItem;
+
+        m_processModel->appendRow(groupRow);
+
+        // Add child items (individual processes)
+        for (const auto& process : groupProcesses) {
+            QList<QStandardItem*> processRow;
+            QStandardItem* childNameItem = new QStandardItem("  " + process.name);
+            childNameItem->setData(process.pid, Qt::UserRole);  // Store PID for context menu
+            processRow << childNameItem;
+
+            QStandardItem* childMemoryItem = new QStandardItem(QString::number(process.memoryMB, 'f', 2));
+            childMemoryItem->setData(process.memoryMB, Qt::UserRole);
+            processRow << childMemoryItem;
+
+            QStandardItem* childCpuItem = new QStandardItem(QString::number(process.cpuPercent, 'f', 1));
+            childCpuItem->setData(process.cpuPercent, Qt::UserRole);
+            processRow << childCpuItem;
+
+            QStandardItem* childPidItem = new QStandardItem(QString::number(process.pid));
+            childPidItem->setData(process.pid, Qt::UserRole);
+            processRow << childPidItem;
+
+            QStandardItem* childCountItem = new QStandardItem("");  // Empty for individual processes
+            processRow << childCountItem;
+
+            groupRow.first()->appendRow(processRow);
+        }
     }
 
     // Update process count
     m_processCountLabel->setText(QString("Processes: %1").arg(processes.size()));
 
-    // Sort by PID by default
-    m_processTableView->sortByColumn(TABLE_COLUMN_PID, Qt::AscendingOrder);
+    // Expand all groups by default
+    m_processTreeView->expandAll();
 }
 
 /**
- * @brief Clear the process table
+ * @brief Clear the process tree
  */
-void MainWindow::clearProcessTable_() {
+void MainWindow::clearProcessTree_() {
     m_processModel->clear();
     m_processModel->setHorizontalHeaderLabels(
-        {"PID", "Process Name", "Memory (MB)", "CPU %", "Actions"});
+        {"Process Name", "Memory (MB)", "CPU %", "PID", "Count"});
 }
 
 /**
  * @brief Get the PID of the currently selected process
- * @return PID or -1 if no selection
+ * @return PID or -1 if no selection or group selected
  */
 int MainWindow::getSelectedProcessPID_() const {
-    const QModelIndexList selectedRows = m_processTableView->selectionModel()->selectedRows();
+    const QModelIndexList selectedRows = m_processTreeView->selectionModel()->selectedRows();
     if (selectedRows.isEmpty()) {
         return -1;
     }
@@ -327,7 +382,14 @@ int MainWindow::getSelectedProcessPID_() const {
         return -1;
     }
 
-    return m_processModel->item(index.row(), TABLE_COLUMN_PID)->data(Qt::UserRole).toInt();
+    // Check if this is a group item (parent) or individual process item (child)
+    if (index.parent().isValid()) {
+        // This is a child item (individual process)
+        return m_processModel->itemFromIndex(index.siblingAtColumn(TREE_COLUMN_PID))->data(Qt::UserRole).toInt();
+    } else {
+        // This is a group item, don't allow termination of groups
+        return -1;
+    }
 }
 
 /**
