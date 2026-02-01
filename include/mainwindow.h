@@ -2,7 +2,7 @@
 #define MAINWINDOW_H
 
 #include <QMainWindow>
-#include <QTableView>
+#include <QTreeView>
 #include <QStandardItemModel>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -44,14 +44,14 @@ private slots:
 private:
     // UI setup methods
     void setupUI_();
-    void setupTableView_();
+    void setupTreeView_();
     void setupToolbar_();
     void setupStatusBar_();
     void setupContextMenu_();
 
     // Table management
-    void updateProcessTable_(const QVector<ProcessInfo>& processes);
-    void clearProcessTable_();
+    void updateProcessTree_(const QVector<ProcessInfo>& processes);
+    void clearProcessTree_();
     [[nodiscard]] int getSelectedProcessPID_() const;
 
     // UI helper methods
@@ -63,7 +63,7 @@ private:
     std::unique_ptr<QHBoxLayout> m_toolbarLayout;
 
     // Core UI components
-    std::unique_ptr<QTableView> m_processTableView;
+    std::unique_ptr<QTreeView> m_processTreeView;
     std::unique_ptr<QStandardItemModel> m_processModel;
     std::unique_ptr<QPushButton> m_refreshButton;
     std::unique_ptr<QPushButton> m_autoRefreshButton;
@@ -79,11 +79,11 @@ private:
     std::unique_ptr<QAction> m_killGracefullyAction;
 
     // Constants
-    static constexpr int TABLE_COLUMN_PID = 0;
-    static constexpr int TABLE_COLUMN_NAME = 1;
-    static constexpr int TABLE_COLUMN_MEMORY = 2;
-    static constexpr int TABLE_COLUMN_CPU = 3;
-    static constexpr int TABLE_COLUMN_ACTIONS = 4;
+    static constexpr int TREE_COLUMN_NAME = 0;
+    static constexpr int TREE_COLUMN_MEMORY = 1;
+    static constexpr int TREE_COLUMN_CPU = 2;
+    static constexpr int TREE_COLUMN_PID = 3;
+    static constexpr int TREE_COLUMN_COUNT = 4;
 };
 
 #endif // MAINWINDOW_H
