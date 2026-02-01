@@ -34,12 +34,15 @@ MainWindow::MainWindow(QWidget* parent)
     , m_processModel(std::make_unique<QStandardItemModel>(this))
     , m_refreshButton(std::make_unique<QPushButton>("Refresh", this))
     , m_autoRefreshButton(std::make_unique<QPushButton>("Auto Refresh", this))
+    , m_focusModeButton(std::make_unique<QPushButton>("Focus Mode", this))
     , m_statusLabel(std::make_unique<QLabel>("Ready", this))
     , m_processCountLabel(std::make_unique<QLabel>("Processes: 0", this))
     , m_processManager(std::make_unique<ProcessManager>(this))
     , m_contextMenu(std::make_unique<QMenu>(this))
     , m_killProcessAction(std::make_unique<QAction>("Kill Process", this))
-    , m_killGracefullyAction(std::make_unique<QAction>("Kill Gracefully", this)) {
+    , m_killGracefullyAction(std::make_unique<QAction>("Kill Gracefully", this))
+    , m_suspendProcessAction(std::make_unique<QAction>("Suspend Process", this))
+    , m_resumeProcessAction(std::make_unique<QAction>("Resume Process", this)) {
 
     // Set window properties
     setWindowTitle("LuminaTask - Linux System Monitor");
@@ -62,10 +65,18 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::onRefreshButtonClicked_);
     connect(m_autoRefreshButton.get(), &QPushButton::toggled,
             this, &MainWindow::onAutoRefreshToggled_);
+    connect(m_focusModeButton.get(), &QPushButton::toggled,
+            this, &MainWindow::onFocusModeToggled_);
     connect(m_killProcessAction.get(), &QAction::triggered,
             this, &MainWindow::onKillProcessAction_);
     connect(m_killGracefullyAction.get(), &QAction::triggered,
             this, &MainWindow::onKillGracefullyAction_);
+    connect(m_suspendProcessAction.get(), &QAction::triggered,
+            this, &MainWindow::onSuspendProcessAction_);
+    connect(m_resumeProcessAction.get(), &QAction::triggered,
+            this, &MainWindow::onResumeProcessAction_);
+    connect(m_processManager.get(), &ProcessManager::memoryLeakDetected,
+            this, &MainWindow::onMemoryLeakDetected_);
 
     // Initial process list load
     onRefreshButtonClicked_();
@@ -110,7 +121,7 @@ void MainWindow::setupUI_() {
 void MainWindow::setupTreeView_() {
     // Set tree model
     m_processModel->setHorizontalHeaderLabels(
-        {"Process Name", "Memory (MB)", "CPU %", "PID", "Count"});
+        {"Process Name", "State", "Memory (MB)", "CPU %", "Priority", "PID", "Count"});
     m_processTreeView->setModel(m_processModel.get());
 
     // Configure tree appearance
@@ -125,8 +136,10 @@ void MainWindow::setupTreeView_() {
     QHeaderView* header = m_processTreeView->header();
     header->setStretchLastSection(true);
     header->setSectionResizeMode(TREE_COLUMN_NAME, QHeaderView::Stretch);
+    header->setSectionResizeMode(TREE_COLUMN_STATE, QHeaderView::ResizeToContents);
     header->setSectionResizeMode(TREE_COLUMN_MEMORY, QHeaderView::ResizeToContents);
     header->setSectionResizeMode(TREE_COLUMN_CPU, QHeaderView::ResizeToContents);
+    header->setSectionResizeMode(TREE_COLUMN_PRIORITY, QHeaderView::ResizeToContents);
     header->setSectionResizeMode(TREE_COLUMN_PID, QHeaderView::ResizeToContents);
     header->setSectionResizeMode(TREE_COLUMN_COUNT, QHeaderView::ResizeToContents);
 
@@ -147,10 +160,15 @@ void MainWindow::setupToolbar_() {
     m_refreshButton->setIcon(QIcon::fromTheme("view-refresh"));
     m_autoRefreshButton->setCheckable(true);
     m_autoRefreshButton->setChecked(true);
+    m_focusModeButton->setCheckable(true);
+    m_focusModeButton->setChecked(false);
+    m_focusModeButton->setIcon(QIcon::fromTheme("applications-games"));
+    m_focusModeButton->setToolTip("Enable Focus Mode (Game Mode) - Optimizes system for foreground app");
 
     // Add buttons to toolbar layout
     m_toolbarLayout->addWidget(m_refreshButton.get());
     m_toolbarLayout->addWidget(m_autoRefreshButton.get());
+    m_toolbarLayout->addWidget(m_focusModeButton.get());
     m_toolbarLayout->addStretch();
     m_toolbarLayout->addWidget(m_processCountLabel.get());
 
@@ -158,6 +176,7 @@ void MainWindow::setupToolbar_() {
     const QSize buttonSize(100, 30);
     m_refreshButton->setFixedSize(buttonSize);
     m_autoRefreshButton->setFixedSize(buttonSize);
+    m_focusModeButton->setFixedSize(buttonSize);
 }
 
 /**
@@ -175,8 +194,13 @@ void MainWindow::setupContextMenu_() {
     // Configure actions
     m_killProcessAction->setIcon(QIcon::fromTheme("process-stop"));
     m_killGracefullyAction->setIcon(QIcon::fromTheme("system-shutdown"));
+    m_suspendProcessAction->setIcon(QIcon::fromTheme("media-playback-pause"));
+    m_resumeProcessAction->setIcon(QIcon::fromTheme("media-playback-start"));
 
     // Add actions to context menu
+    m_contextMenu->addAction(m_suspendProcessAction.get());
+    m_contextMenu->addAction(m_resumeProcessAction.get());
+    m_contextMenu->addSeparator();
     m_contextMenu->addAction(m_killGracefullyAction.get());
     m_contextMenu->addAction(m_killProcessAction.get());
 }
@@ -261,6 +285,95 @@ void MainWindow::onKillGracefullyAction_() {
 }
 
 /**
+ * @brief Handle suspend process action
+ */
+void MainWindow::onSuspendProcessAction_() {
+    const int pid = getSelectedProcessPID_();
+    if (pid == -1) return;
+
+    // Get process name for confirmation dialog
+    const auto processInfo = m_processManager->getProcessInfo(pid);
+    if (!processInfo.has_value()) {
+        showErrorMessage_("Error", "Cannot get process information");
+        return;
+    }
+
+    const QString question = QString("Are you sure you want to suspend process %1 (%2)?")
+                           .arg(pid).arg(processInfo->name);
+
+    const QMessageBox::StandardButton reply = QMessageBox::question(
+        this, "Confirm Process Suspension", question,
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+
+    if (reply == QMessageBox::Yes) {
+        const bool success = m_processManager->suspendProcess(pid);
+        if (success) {
+            m_statusLabel->setText(QString("Process %1 suspended successfully").arg(pid));
+            onRefreshButtonClicked_();  // Refresh to show updated state
+        } else {
+            showErrorMessage_("Suspension Failed",
+                             QString("Failed to suspend process %1").arg(pid));
+        }
+    }
+}
+
+/**
+ * @brief Handle resume process action
+ */
+void MainWindow::onResumeProcessAction_() {
+    const int pid = getSelectedProcessPID_();
+    if (pid == -1) return;
+
+    const bool success = m_processManager->resumeProcess(pid);
+    if (success) {
+        m_statusLabel->setText(QString("Process %1 resumed successfully").arg(pid));
+        onRefreshButtonClicked_();  // Refresh to show updated state
+    } else {
+        showErrorMessage_("Resume Failed",
+                         QString("Failed to resume process %1").arg(pid));
+    }
+}
+
+/**
+ * @brief Handle focus mode toggle
+ */
+void MainWindow::onFocusModeToggled_(bool enabled) {
+    m_processManager->enableFocusMode(enabled);
+    if (enabled) {
+        m_statusLabel->setText("Focus Mode enabled - System optimized for foreground app");
+        m_focusModeButton->setText("Focus Mode ON");
+        m_focusModeButton->setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }");
+    } else {
+        m_statusLabel->setText("Focus Mode disabled - Normal process priorities restored");
+        m_focusModeButton->setText("Focus Mode");
+        m_focusModeButton->setStyleSheet("");
+    }
+}
+
+/**
+ * @brief Handle memory leak detection alert
+ */
+void MainWindow::onMemoryLeakDetected_(int pid, const QString& processName, double growthMB) {
+    const QString message = QString("⚠️ Memory Leak Detected!\n\n"
+                                   "Process: %1 (PID: %2)\n"
+                                   "Memory growth: +%.1f MB in the last minute\n\n"
+                                   "This process may be consuming excessive memory.\n"
+                                   "Consider terminating or suspending it to prevent system instability.")
+                                   .arg(processName).arg(pid).arg(growthMB);
+
+    const QMessageBox::StandardButton reply = QMessageBox::warning(
+        this, "Memory Leak Alert", message,
+        QMessageBox::Ignore | QMessageBox::Open, QMessageBox::Open);
+
+    if (reply == QMessageBox::Open) {
+        // Find and select the problematic process in the tree
+        // This would require implementing a search function in the tree view
+        m_statusLabel->setText(QString("Memory leak detected in %1 (PID: %2)")
+                              .arg(processName).arg(pid));
+    }
+}
+
+/**
  * @brief Update the process tree with new data
  */
 void MainWindow::updateProcessTree_(const QVector<ProcessInfo>& processes) {
@@ -308,6 +421,9 @@ void MainWindow::updateProcessTree_(const QVector<ProcessInfo>& processes) {
         nameItem->setData("group", Qt::UserRole);  // Mark as group item
         groupRow << nameItem;
 
+        QStandardItem* stateItem = new QStandardItem("");  // Empty for groups
+        groupRow << stateItem;
+
         QStandardItem* memoryItem = new QStandardItem(QString::number(totalMemory, 'f', 2));
         memoryItem->setData(totalMemory, Qt::UserRole);
         groupRow << memoryItem;
@@ -315,6 +431,9 @@ void MainWindow::updateProcessTree_(const QVector<ProcessInfo>& processes) {
         QStandardItem* cpuItem = new QStandardItem(QString::number(avgCpu, 'f', 1));
         cpuItem->setData(avgCpu, Qt::UserRole);
         groupRow << cpuItem;
+
+        QStandardItem* priorityItem = new QStandardItem("");  // Empty for groups
+        groupRow << priorityItem;
 
         QStandardItem* pidItem = new QStandardItem("");  // Empty for groups
         groupRow << pidItem;
@@ -332,6 +451,17 @@ void MainWindow::updateProcessTree_(const QVector<ProcessInfo>& processes) {
             childNameItem->setData(process.pid, Qt::UserRole);  // Store PID for context menu
             processRow << childNameItem;
 
+            // State column with visual indicator
+            QStandardItem* childStateItem = new QStandardItem();
+            if (process.state == ProcessState::Suspended) {
+                childStateItem->setText("❄️ Suspended");
+                childStateItem->setForeground(QBrush(QColor(100, 150, 200)));  // Light blue color
+            } else {
+                childStateItem->setText("▶️ Running");
+                childStateItem->setForeground(QBrush(QColor(50, 150, 50)));   // Green color
+            }
+            processRow << childStateItem;
+
             QStandardItem* childMemoryItem = new QStandardItem(QString::number(process.memoryMB, 'f', 2));
             childMemoryItem->setData(process.memoryMB, Qt::UserRole);
             processRow << childMemoryItem;
@@ -339,6 +469,29 @@ void MainWindow::updateProcessTree_(const QVector<ProcessInfo>& processes) {
             QStandardItem* childCpuItem = new QStandardItem(QString::number(process.cpuPercent, 'f', 1));
             childCpuItem->setData(process.cpuPercent, Qt::UserRole);
             processRow << childCpuItem;
+
+            // Priority column with visual indicator
+            QStandardItem* childPriorityItem = new QStandardItem();
+            QString priorityText;
+            if (process.priority < -5) {
+                priorityText = QString("🔥 High (%1)").arg(process.priority);
+                childPriorityItem->setForeground(QBrush(QColor(255, 100, 100)));  // Red for high priority
+            } else if (process.priority > 5) {
+                priorityText = QString("🐌 Low (%1)").arg(process.priority);
+                childPriorityItem->setForeground(QBrush(QColor(150, 150, 150)));   // Gray for low priority
+            } else {
+                priorityText = QString("⚖️ Normal (%1)").arg(process.priority);
+                childPriorityItem->setForeground(QBrush(QColor(100, 100, 100)));
+            }
+            
+            // Add memory leak warning indicator
+            if (process.isMemoryLeech) {
+                priorityText = "⚠️ " + priorityText + " (LEAK!)";
+                childPriorityItem->setForeground(QBrush(QColor(255, 165, 0)));  // Orange for memory leak
+            }
+            
+            childPriorityItem->setText(priorityText);
+            processRow << childPriorityItem;
 
             QStandardItem* childPidItem = new QStandardItem(QString::number(process.pid));
             childPidItem->setData(process.pid, Qt::UserRole);
@@ -364,7 +517,7 @@ void MainWindow::updateProcessTree_(const QVector<ProcessInfo>& processes) {
 void MainWindow::clearProcessTree_() {
     m_processModel->clear();
     m_processModel->setHorizontalHeaderLabels(
-        {"Process Name", "Memory (MB)", "CPU %", "PID", "Count"});
+        {"Process Name", "State", "Memory (MB)", "CPU %", "Priority", "PID", "Count"});
 }
 
 /**
