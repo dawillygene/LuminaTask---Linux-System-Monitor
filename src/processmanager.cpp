@@ -13,18 +13,22 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/resource.h>
 #include <pwd.h>
 #include <grp.h>
 #include <cstring>
 #include <cerrno>
 #include <cstdlib>
+#include <QDateTime>
+#include <QMap>
 
 /**
  * @brief Constructor for ProcessManager
  */
 ProcessManager::ProcessManager(QObject* parent)
     : QObject(parent)
-    , m_refreshTimer(std::make_unique<QTimer>(this)) {
+    , m_refreshTimer(std::make_unique<QTimer>(this))
+    , m_focusModeEnabled(false) {
 
     // Connect timer signal
     connect(m_refreshTimer.get(), &QTimer::timeout,
@@ -45,7 +49,7 @@ ProcessManager::~ProcessManager() {
  * @brief Get information for all running processes
  * @return QVector of ProcessInfo structures
  */
-QVector<ProcessInfo> ProcessManager::getAllProcesses() const {
+QVector<ProcessInfo> ProcessManager::getAllProcesses() {
     QVector<ProcessInfo> processes;
     processes.reserve(MAX_PROCESS_COUNT);
 
@@ -84,7 +88,7 @@ QVector<ProcessInfo> ProcessManager::getAllProcesses() const {
  * @param processID The process ID to query
  * @return Optional ProcessInfo structure
  */
-std::optional<ProcessInfo> ProcessManager::getProcessInfo(int processID) const {
+std::optional<ProcessInfo> ProcessManager::getProcessInfo(int processID) {
     if (!isValidProcessID_(processID)) {
         qWarning() << "Invalid PID requested:" << processID;
         return std::nullopt;
@@ -100,8 +104,23 @@ std::optional<ProcessInfo> ProcessManager::getProcessInfo(int processID) const {
         const QString processName = readProcessName_(processID);
         const double memoryMB = readProcessMemory_(processID);
         const double cpuPercent = readProcessCpu_(processID);
+        const ProcessState state = readProcessState_(processID);
+        const int priority = readProcessPriority_(processID);
 
-        return ProcessInfo(processID, processName, memoryMB, cpuPercent);
+        ProcessInfo processInfo(processID, processName, memoryMB, cpuPercent, state);
+        processInfo.priority = priority;
+        
+        // Update memory history and detect leaks
+        updateMemoryHistory_(processInfo);
+        processInfo.isMemoryLeech = detectMemoryLeak_(processInfo);
+        
+        if (processInfo.isMemoryLeech) {
+            const double growthMB = processInfo.memoryHistory.size() >= 2 ? 
+                processInfo.memoryMB - processInfo.memoryHistory.first().second : 0.0;
+            emit memoryLeakDetected(processID, processName, growthMB);
+        }
+
+        return processInfo;
     } catch (const ProcessException& e) {
         qWarning() << "Error reading process" << processID << ":" << e.what();
         return std::nullopt;
@@ -140,6 +159,315 @@ bool ProcessManager::terminateProcess(int processID, TerminationMethod method) {
 }
 
 /**
+ * @brief Read process state from /proc/[PID]/stat
+ * @param pid Process ID
+ * @return ProcessState (Running or Suspended)
+ */
+ProcessState ProcessManager::readProcessState_(int pid) const {
+    const QString statPath = QString("/proc/%1/stat").arg(pid);
+    QFile statFile(statPath);
+
+    if (!statFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return ProcessState::Running;  // Default to running if can't read
+    }
+
+    QTextStream stream(&statFile);
+    const QString line = stream.readLine();
+
+    if (line.isEmpty()) {
+        return ProcessState::Running;
+    }
+
+    // Parse the stat line - process state is field 3 (after pid and comm)
+    // Format: pid (comm) state ...
+    const QStringList parts = line.split(' ', Qt::SkipEmptyParts);
+
+    if (parts.size() < 3) {
+        return ProcessState::Running;
+    }
+
+    // State field: R=running, S=sleeping, D=disk sleep, T=stopped, Z=zombie, etc.
+    const QString state = parts[2];
+    
+    if (state == "T" || state == "t") {
+        return ProcessState::Suspended;  // Process is stopped (SIGSTOP)
+    }
+
+    return ProcessState::Running;
+}
+
+/**
+ * @brief Set process priority using setpriority
+ * @param processID The process ID
+ * @param priority Nice value (-20 to 19, lower = higher priority)
+ * @return true if successful, false otherwise
+ */
+bool ProcessManager::setPriority(int processID, int priority) {
+    if (!isValidProcessID_(processID)) {
+        qWarning() << "Invalid PID for priority change:" << processID;
+        return false;
+    }
+
+    // Clamp priority to valid range
+    priority = qBound(-20, priority, 19);
+
+    const int result = setpriority(PRIO_PROCESS, processID, priority);
+    
+    if (result == 0) {
+        qInfo() << "Successfully set priority" << priority << "for process" << processID;
+        return true;
+    } else {
+        qWarning() << "Failed to set priority for process" << processID << ":" << strerror(errno);
+        return false;
+    }
+}
+
+/**
+ * @brief Update memory history for a process
+ * @param processInfo Process information to update
+ */
+void ProcessManager::updateMemoryHistory_(ProcessInfo& processInfo) {
+    const qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
+    
+    // Get existing history for this process
+    auto& history = m_processMemoryHistory[processInfo.pid];
+    
+    // Add current memory usage to history
+    history.append(qMakePair(currentTime, processInfo.memoryMB));
+    
+    // Remove old entries (older than 1 minute)
+    while (!history.isEmpty() && 
+           (currentTime - history.first().first) > MEMORY_LEAK_TIME_WINDOW_MS) {
+        history.removeFirst();
+    }
+    
+    // Limit history size
+    while (history.size() > HISTORY_MAX_ENTRIES) {
+        history.removeFirst();
+    }
+    
+    // Copy history to process info
+    processInfo.memoryHistory = history;
+}
+
+/**
+ * @brief Detect if a process is leaking memory
+ * @param processInfo Process information to check
+ * @return true if memory leak detected, false otherwise
+ */
+bool ProcessManager::detectMemoryLeak_(const ProcessInfo& processInfo) const {
+    if (processInfo.memoryHistory.size() < 2) {
+        return false;  // Need at least 2 data points
+    }
+    
+    const auto& history = processInfo.memoryHistory;
+    const qint64 currentTime = history.last().first;
+    const double currentMemory = history.last().second;
+    
+    // Find memory usage from 1 minute ago (or closest available)
+    double oldMemory = currentMemory;
+    qint64 oldTime = currentTime;
+    
+    for (const auto& entry : history) {
+        if ((currentTime - entry.first) >= MEMORY_LEAK_TIME_WINDOW_MS * 0.8) {  // 80% of window
+            oldMemory = entry.second;
+            oldTime = entry.first;
+            break;
+        }
+    }
+    
+    // Calculate memory growth
+    const double memoryGrowthMB = currentMemory - oldMemory;
+    const qint64 timeSpanMS = currentTime - oldTime;
+    
+    // Check if growth exceeds threshold
+    if (timeSpanMS > 0 && memoryGrowthMB > MEMORY_LEAK_THRESHOLD_MB) {
+        // Normalize to 1-minute window
+        const double normalizedGrowth = (memoryGrowthMB * MEMORY_LEAK_TIME_WINDOW_MS) / timeSpanMS;
+        return normalizedGrowth > MEMORY_LEAK_THRESHOLD_MB;
+    }
+    
+    return false;
+}
+
+/**
+ * @brief Enable or disable focus mode
+ * @param enabled True to enable focus mode, false to disable
+ */
+void ProcessManager::enableFocusMode(bool enabled) {
+    if (m_focusModeEnabled == enabled) {
+        return;  // No change
+    }
+    
+    m_focusModeEnabled = enabled;
+    
+    if (enabled) {
+        qInfo() << "Focus mode enabled";
+        optimizeForFocusedApp_();
+    } else {
+        qInfo() << "Focus mode disabled";
+        // Reset all process priorities to normal
+        for (const auto& process : m_cachedProcesses) {
+            (void)setPriority(process.pid, 0);  // Normal priority (ignore result)
+        }
+    }
+    
+    emit focusModeChanged(enabled);
+}
+
+/**
+ * @brief Optimize system for focused application
+ */
+void ProcessManager::optimizeForFocusedApp_() {
+    if (!m_focusModeEnabled) {
+        return;
+    }
+    
+    const int focusedPID = getFocusedWindowPID_();
+    
+    for (const auto& process : m_cachedProcesses) {
+        if (process.pid == focusedPID) {
+            // Boost focused app priority
+            (void)setPriority(process.pid, -10);  // High priority (ignore result)
+        } else if (isBackgroundProcess_(process)) {
+            // Lower priority for background tasks
+            (void)setPriority(process.pid, 10);   // Low priority (ignore result)
+        }
+    }
+}
+
+/**
+ * @brief Read process priority from /proc/[PID]/stat
+ * @param pid Process ID
+ * @return Process nice value
+ */
+int ProcessManager::readProcessPriority_(int pid) const {
+    const QString statPath = QString("/proc/%1/stat").arg(pid);
+    QFile statFile(statPath);
+
+    if (!statFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return 0;  // Default priority
+    }
+
+    QTextStream stream(&statFile);
+    const QString line = stream.readLine();
+
+    if (line.isEmpty()) {
+        return 0;
+    }
+
+    // Parse the stat line - nice value is field 19
+    const QStringList parts = line.split(' ', Qt::SkipEmptyParts);
+
+    if (parts.size() < 19) {
+        return 0;
+    }
+
+    bool ok;
+    const int nice = parts[18].toInt(&ok);
+    return ok ? nice : 0;
+}
+
+/**
+ * @brief Get PID of currently focused window (simplified implementation)
+ * @return PID of focused process, or 0 if unable to determine
+ */
+int ProcessManager::getFocusedWindowPID_() const {
+    // Simplified implementation - in reality, this would use X11/Wayland APIs
+    // For now, we'll use a heuristic: the process with highest CPU that's not a background task
+    
+    int focusedPID = 0;
+    double highestCPU = 0.0;
+    
+    for (const auto& process : m_cachedProcesses) {
+        if (!isBackgroundProcess_(process) && process.cpuPercent > highestCPU) {
+            highestCPU = process.cpuPercent;
+            focusedPID = process.pid;
+        }
+    }
+    
+    return focusedPID;
+}
+
+/**
+ * @brief Check if a process is a background task
+ * @param processInfo Process to check
+ * @return true if it's a background process
+ */
+bool ProcessManager::isBackgroundProcess_(const ProcessInfo& processInfo) const {
+    // Common background processes/services
+    const QStringList backgroundProcesses = {
+        "systemd", "kthreadd", "ksoftirqd", "rcu_", "watchdog",
+        "systemd-", "dbus", "NetworkManager", "pulseaudio",
+        "tracker", "baloo", "updatedb", "indexer", "backup",
+        "cron", "anacron", "rsyslog", "accounts-daemon"
+    };
+    
+    for (const QString& bgProcess : backgroundProcesses) {
+        if (processInfo.name.contains(bgProcess, Qt::CaseInsensitive)) {
+            return true;
+        }
+    }
+    
+    // Low CPU usage processes are likely background
+    return processInfo.cpuPercent < 1.0 && processInfo.memoryMB > 50.0;
+}
+
+/**
+ * @brief Suspend a process using SIGSTOP
+ * @param processID The process ID to suspend
+ * @return true if successful, false otherwise
+ */
+bool ProcessManager::suspendProcess(int processID) {
+    if (!isValidProcessID_(processID)) {
+        qWarning() << "Invalid PID for suspension:" << processID;
+        return false;
+    }
+
+    if (!canKillProcess_(processID)) {
+        qWarning() << "Cannot suspend process" << processID << "(permission denied or doesn't exist)";
+        return false;
+    }
+
+    const int result = kill(processID, SIGSTOP);
+
+    if (result == 0) {
+        qInfo() << "Successfully suspended process" << processID;
+        return true;
+    } else {
+        qWarning() << "Failed to suspend process" << processID << ":" << strerror(errno);
+        return false;
+    }
+}
+
+/**
+ * @brief Resume a suspended process using SIGCONT
+ * @param processID The process ID to resume
+ * @return true if successful, false otherwise
+ */
+bool ProcessManager::resumeProcess(int processID) {
+    if (!isValidProcessID_(processID)) {
+        qWarning() << "Invalid PID for resumption:" << processID;
+        return false;
+    }
+
+    if (!canKillProcess_(processID)) {
+        qWarning() << "Cannot resume process" << processID << "(permission denied or doesn't exist)";
+        return false;
+    }
+
+    const int result = kill(processID, SIGCONT);
+
+    if (result == 0) {
+        qInfo() << "Successfully resumed process" << processID;
+        return true;
+    } else {
+        qWarning() << "Failed to resume process" << processID << ":" << strerror(errno);
+        return false;
+    }
+}
+
+/**
  * @brief Start periodic process list refresh
  * @param interval Refresh interval in milliseconds
  */
@@ -161,6 +489,15 @@ void ProcessManager::stopPeriodicRefresh() {
  */
 void ProcessManager::refreshProcessList_() {
     const QVector<ProcessInfo> processes = getAllProcesses();
+    
+    // Update cached processes for focus mode
+    m_cachedProcesses = processes;
+    
+    // Optimize for focused app if focus mode is enabled
+    if (m_focusModeEnabled) {
+        optimizeForFocusedApp_();
+    }
+    
     emit processesUpdated(processes);
 }
 
