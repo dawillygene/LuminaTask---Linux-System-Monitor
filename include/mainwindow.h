@@ -39,7 +39,11 @@ private slots:
     void onRefreshButtonClicked_();
     void onKillProcessAction_();
     void onKillGracefullyAction_();
+    void onSuspendProcessAction_();
+    void onResumeProcessAction_();
     void onAutoRefreshToggled_(bool enabled);
+    void onFocusModeToggled_(bool enabled);
+    void onMemoryLeakDetected_(int pid, const QString& processName, double growthMB);
 
 private:
     // UI setup methods
@@ -67,6 +71,7 @@ private:
     std::unique_ptr<QStandardItemModel> m_processModel;
     std::unique_ptr<QPushButton> m_refreshButton;
     std::unique_ptr<QPushButton> m_autoRefreshButton;
+    std::unique_ptr<QPushButton> m_focusModeButton;
     std::unique_ptr<QLabel> m_statusLabel;
     std::unique_ptr<QLabel> m_processCountLabel;
 
@@ -77,13 +82,17 @@ private:
     std::unique_ptr<QMenu> m_contextMenu;
     std::unique_ptr<QAction> m_killProcessAction;
     std::unique_ptr<QAction> m_killGracefullyAction;
+    std::unique_ptr<QAction> m_suspendProcessAction;
+    std::unique_ptr<QAction> m_resumeProcessAction;
 
     // Constants
     static constexpr int TREE_COLUMN_NAME = 0;
-    static constexpr int TREE_COLUMN_MEMORY = 1;
-    static constexpr int TREE_COLUMN_CPU = 2;
-    static constexpr int TREE_COLUMN_PID = 3;
-    static constexpr int TREE_COLUMN_COUNT = 4;
+    static constexpr int TREE_COLUMN_STATE = 1;
+    static constexpr int TREE_COLUMN_MEMORY = 2;
+    static constexpr int TREE_COLUMN_CPU = 3;
+    static constexpr int TREE_COLUMN_PRIORITY = 4;
+    static constexpr int TREE_COLUMN_PID = 5;
+    static constexpr int TREE_COLUMN_COUNT = 6;
 };
 
 #endif // MAINWINDOW_H
