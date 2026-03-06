@@ -287,7 +287,7 @@ This project is open source. See LICENSE file for details.
 
 ## Author
 
-**ELIA WILLIAM MARIKI (dawillygene)**  
+** dawillygene **  
 GitHub: https://github.com/dawillygene
 
 ## Acknowledgments
